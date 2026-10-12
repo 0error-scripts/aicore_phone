@@ -157,7 +157,56 @@ lib.callback.register('qb-phone:server:GetPhoneData', function(source)
         }
         PhoneData.Adverts = Adverts
 
-        local result = MySQL.query.await('SELECT * FROM player_contacts WHERE citizenid = ? ORDER BY name ASC', {Player.PlayerData.citizenid})
+        -- The queries below are independent of each other, so fire them concurrently
+        -- to avoid sequential round-trip latency stacking on every phone load.
+        -- Each thread writes its result into `results`; the callback thread waits
+        -- here until all of them complete. Post-processing below is unchanged.
+        local results = {}
+        local pending = 8
+        local citizenid = Player.PlayerData.citizenid
+        CreateThread(function()
+            local ok, res = pcall(MySQL.query.await, 'SELECT * FROM player_contacts WHERE citizenid = ? ORDER BY name ASC', {citizenid})
+            results.contacts = (ok and res) or {}
+            pending = pending - 1
+        end)
+        CreateThread(function()
+            local ok, res = pcall(MySQL.query.await, 'SELECT * FROM phone_invoices WHERE citizenid = ?', {citizenid})
+            results.invoices = (ok and res) or {}
+            pending = pending - 1
+        end)
+        CreateThread(function()
+            local ok, res = pcall(MySQL.query.await, 'SELECT * FROM player_vehicles WHERE citizenid = ?', {citizenid})
+            results.garage = (ok and res) or {}
+            pending = pending - 1
+        end)
+        CreateThread(function()
+            local ok, res = pcall(MySQL.query.await, 'SELECT * FROM phone_messages WHERE citizenid = ?', {citizenid})
+            results.messages = (ok and res) or {}
+            pending = pending - 1
+        end)
+        CreateThread(function()
+            local ok, res = pcall(MySQL.query.await, 'SELECT * FROM phone_tweets WHERE `date` > NOW() - INTERVAL ? hour', {Config.TweetDuration})
+            results.tweets = (ok and res) or {}
+            pending = pending - 1
+        end)
+        CreateThread(function()
+            local ok, res = pcall(MySQL.query.await, 'SELECT * FROM player_mails WHERE citizenid = ? ORDER BY `date` ASC', {citizenid})
+            results.mails = (ok and res) or {}
+            pending = pending - 1
+        end)
+        CreateThread(function()
+            local ok, res = pcall(MySQL.query.await, 'SELECT * FROM crypto_transactions WHERE citizenid = ? ORDER BY `date` ASC', {citizenid})
+            results.transactions = (ok and res) or {}
+            pending = pending - 1
+        end)
+        CreateThread(function()
+            local ok, res = pcall(MySQL.query.await, 'SELECT * FROM phone_gallery WHERE citizenid = ? ORDER BY `date` DESC', {citizenid})
+            results.images = (ok and res) or {}
+            pending = pending - 1
+        end)
+        while pending > 0 do Wait(0) end
+
+        local result = results.contacts
         if result[1] ~= nil then
             for _, v in pairs(result) do
                 v.status = GetOnlineStatus(v.number)
@@ -166,26 +215,44 @@ lib.callback.register('qb-phone:server:GetPhoneData', function(source)
             PhoneData.PlayerContacts = result
         end
 
-        local invoices = MySQL.query.await('SELECT * FROM phone_invoices WHERE citizenid = ?', {Player.PlayerData.citizenid})
+        local invoices = results.invoices
         if invoices[1] ~= nil then
+            local offlineSenders = {}
+            local offlineInvoices = {}
             for _, v in pairs(invoices) do
                 local Ply = exports.aicore:GetPlayerByCitizenId(v.sender)
                 if Ply ~= nil then
                     v.number = Ply.PlayerData.charinfo.phone
                 else
-                    local res = MySQL.query.await('SELECT * FROM players WHERE citizenid = ?', {v.sender})
-                    if res[1] ~= nil then
-                        res[1].charinfo = json.decode(res[1].charinfo)
-                        v.number = res[1].charinfo.phone
-                    else
-                        v.number = nil
+                    -- Collect offline senders; resolve their numbers with a
+                    -- single batched lookup after the loop (no per-invoice N+1).
+                    offlineSenders[v.sender] = true
+                    offlineInvoices[#offlineInvoices+1] = v
+                end
+            end
+            local senderIds = {}
+            for senderId in pairs(offlineSenders) do
+                senderIds[#senderIds+1] = senderId
+            end
+            if #senderIds > 0 then
+                local placeholders = {}
+                for i = 1, #senderIds do placeholders[i] = '?' end
+                local senderRows = MySQL.query.await('SELECT * FROM players WHERE citizenid IN (' .. table.concat(placeholders, ', ') .. ')', senderIds)
+                local phonesBySender = {}
+                if senderRows[1] ~= nil then
+                    for _, row in pairs(senderRows) do
+                        row.charinfo = json.decode(row.charinfo)
+                        phonesBySender[row.citizenid] = row.charinfo.phone
                     end
+                end
+                for _, v in pairs(offlineInvoices) do
+                    v.number = phonesBySender[v.sender]
                 end
             end
             PhoneData.Invoices = invoices
         end
 
-        local garageresult = MySQL.query.await('SELECT * FROM player_vehicles WHERE citizenid = ?', {Player.PlayerData.citizenid})
+        local garageresult = results.garage
         if garageresult[1] ~= nil then
             for _, v in pairs(garageresult) do
                 local vehicleModel = v.vehicle
@@ -199,7 +266,7 @@ lib.callback.register('qb-phone:server:GetPhoneData', function(source)
             PhoneData.Garage = garageresult
         end
 
-        local messages = MySQL.query.await('SELECT * FROM phone_messages WHERE citizenid = ?', {Player.PlayerData.citizenid})
+        local messages = results.messages
         if messages ~= nil and next(messages) ~= nil then
             PhoneData.Chats = messages
         end
@@ -216,14 +283,14 @@ lib.callback.register('qb-phone:server:GetPhoneData', function(source)
             PhoneData.Hashtags = Hashtags
         end
 
-        local Tweets = MySQL.query.await('SELECT * FROM phone_tweets WHERE `date` > NOW() - INTERVAL ? hour', {Config.TweetDuration})
+        local Tweets = results.tweets
 
         if Tweets ~= nil and next(Tweets) ~= nil then
             PhoneData.Tweets = Tweets
             TWData = Tweets
         end
 
-        local mails = MySQL.query.await('SELECT * FROM player_mails WHERE citizenid = ? ORDER BY `date` ASC', {Player.PlayerData.citizenid})
+        local mails = results.mails
         if mails[1] ~= nil then
             for k, _ in pairs(mails) do
                 if mails[k].button ~= nil then
@@ -233,7 +300,7 @@ lib.callback.register('qb-phone:server:GetPhoneData', function(source)
             PhoneData.Mails = mails
         end
 
-        local transactions = MySQL.query.await('SELECT * FROM crypto_transactions WHERE citizenid = ? ORDER BY `date` ASC', {Player.PlayerData.citizenid})
+        local transactions = results.transactions
         if transactions[1] ~= nil then
             for _, v in pairs(transactions) do
                 PhoneData.CryptoTransactions[#PhoneData.CryptoTransactions+1] = {
@@ -242,7 +309,7 @@ lib.callback.register('qb-phone:server:GetPhoneData', function(source)
                 }
             end
         end
-        local images = MySQL.query.await('SELECT * FROM phone_gallery WHERE citizenid = ? ORDER BY `date` DESC',{Player.PlayerData.citizenid})
+        local images = results.images
         if images ~= nil and next(images) ~= nil then
             PhoneData.Images = images
         end
